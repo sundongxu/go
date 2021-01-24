@@ -7,8 +7,10 @@ package search
 import (
 	"cmd/go/internal/base"
 	"cmd/go/internal/cfg"
+	"cmd/go/internal/fsys"
 	"fmt"
 	"go/build"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
@@ -127,9 +129,12 @@ func (m *Match) MatchPackages() {
 		if m.pattern == "cmd" {
 			root += "cmd" + string(filepath.Separator)
 		}
-		err := filepath.Walk(root, func(path string, fi os.FileInfo, err error) error {
-			if err != nil || path == src {
-				return nil
+		err := fsys.Walk(root, func(path string, fi fs.FileInfo, err error) error {
+			if err != nil {
+				return err // Likely a permission error, which could interfere with matching.
+			}
+			if path == src {
+				return nil // GOROOT/src and GOPATH/src cannot contain packages.
 			}
 
 			want := true
@@ -150,8 +155,8 @@ func (m *Match) MatchPackages() {
 			}
 
 			if !fi.IsDir() {
-				if fi.Mode()&os.ModeSymlink != 0 && want {
-					if target, err := os.Stat(path); err == nil && target.IsDir() {
+				if fi.Mode()&fs.ModeSymlink != 0 && want {
+					if target, err := fsys.Stat(path); err == nil && target.IsDir() {
 						fmt.Fprintf(os.Stderr, "warning: ignoring symlink %s\n", path)
 					}
 				}
@@ -260,13 +265,16 @@ func (m *Match) MatchDirs() {
 		}
 	}
 
-	err := filepath.Walk(dir, func(path string, fi os.FileInfo, err error) error {
-		if err != nil || !fi.IsDir() {
+	err := fsys.Walk(dir, func(path string, fi fs.FileInfo, err error) error {
+		if err != nil {
+			return err // Likely a permission error, which could interfere with matching.
+		}
+		if !fi.IsDir() {
 			return nil
 		}
 		top := false
 		if path == dir {
-			// filepath.Walk starts at dir and recurses. For the recursive case,
+			// Walk starts at dir and recurses. For the recursive case,
 			// the path is the result of filepath.Join, which calls filepath.Clean.
 			// The initial case is not Cleaned, though, so we do this explicitly.
 			//
@@ -287,7 +295,7 @@ func (m *Match) MatchDirs() {
 
 		if !top && cfg.ModulesEnabled {
 			// Ignore other modules found in subdirectories.
-			if fi, err := os.Stat(filepath.Join(path, "go.mod")); err == nil && !fi.IsDir() {
+			if fi, err := fsys.Stat(filepath.Join(path, "go.mod")); err == nil && !fi.IsDir() {
 				return filepath.SkipDir
 			}
 		}

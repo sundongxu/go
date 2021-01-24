@@ -9,9 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"io/fs"
 	"net/url"
-	"os"
 	"path"
 	pathpkg "path"
 	"path/filepath"
@@ -37,65 +36,8 @@ URLs of a specified form. The requests have no query parameters, so even
 a site serving from a fixed file system (including a file:/// URL)
 can be a module proxy.
 
-The GET requests sent to a Go module proxy are:
-
-GET $GOPROXY/<module>/@v/list returns a list of known versions of the given
-module, one per line.
-
-GET $GOPROXY/<module>/@v/<version>.info returns JSON-formatted metadata
-about that version of the given module.
-
-GET $GOPROXY/<module>/@v/<version>.mod returns the go.mod file
-for that version of the given module.
-
-GET $GOPROXY/<module>/@v/<version>.zip returns the zip archive
-for that version of the given module.
-
-GET $GOPROXY/<module>/@latest returns JSON-formatted metadata about the
-latest known version of the given module in the same format as
-<module>/@v/<version>.info. The latest version should be the version of
-the module the go command may use if <module>/@v/list is empty or no
-listed version is suitable. <module>/@latest is optional and may not
-be implemented by a module proxy.
-
-When resolving the latest version of a module, the go command will request
-<module>/@v/list, then, if no suitable versions are found, <module>/@latest.
-The go command prefers, in order: the semantically highest release version,
-the semantically highest pre-release version, and the chronologically
-most recent pseudo-version. In Go 1.12 and earlier, the go command considered
-pseudo-versions in <module>/@v/list to be pre-release versions, but this is
-no longer true since Go 1.13.
-
-To avoid problems when serving from case-sensitive file systems,
-the <module> and <version> elements are case-encoded, replacing every
-uppercase letter with an exclamation mark followed by the corresponding
-lower-case letter: github.com/Azure encodes as github.com/!azure.
-
-The JSON-formatted metadata about a given module corresponds to
-this Go data structure, which may be expanded in the future:
-
-    type Info struct {
-        Version string    // version string
-        Time    time.Time // commit time
-    }
-
-The zip archive for a specific version of a given module is a
-standard zip file that contains the file tree corresponding
-to the module's source code and related files. The archive uses
-slash-separated paths, and every file path in the archive must
-begin with <module>@<version>/, where the module and version are
-substituted directly, not case-encoded. The root of the module
-file tree corresponds to the <module>@<version>/ prefix in the
-archive.
-
-Even when downloading directly from version control systems,
-the go command synthesizes explicit info, mod, and zip files
-and stores them in its local cache, $GOPATH/pkg/mod/cache/download,
-the same as if it had downloaded them directly from a proxy.
-The cache layout is the same as the proxy URL space, so
-serving $GOPATH/pkg/mod/cache/download at (or copying it to)
-https://example.com/proxy would let other users access those
-cached module versions with GOPROXY=https://example.com/proxy.
+For details on the GOPROXY protocol, see
+https://golang.org/ref/mod#goproxy-protocol.
 `,
 }
 
@@ -171,6 +113,14 @@ func proxyList() ([]proxySpec, error) {
 				fallBackOnError: fallBackOnError,
 			})
 		}
+
+		if len(proxyOnce.list) == 0 ||
+			len(proxyOnce.list) == 1 && proxyOnce.list[0].url == "noproxy" {
+			// There were no proxies, other than the implicit "noproxy" added when
+			// GONOPROXY is set. This can happen if GOPROXY is a non-empty string
+			// like "," or " ".
+			proxyOnce.err = fmt.Errorf("GOPROXY list is not the empty string, but contains no entries")
+		}
 	})
 
 	return proxyOnce.list, proxyOnce.err
@@ -178,7 +128,7 @@ func proxyList() ([]proxySpec, error) {
 
 // TryProxies iterates f over each configured proxy (including "noproxy" and
 // "direct" if applicable) until f returns no error or until f returns an
-// error that is not equivalent to os.ErrNotExist on a proxy configured
+// error that is not equivalent to fs.ErrNotExist on a proxy configured
 // not to fall back on errors.
 //
 // TryProxies then returns that final error.
@@ -191,13 +141,17 @@ func TryProxies(f func(proxy string) error) error {
 		return err
 	}
 	if len(proxies) == 0 {
-		return f("off")
+		panic("GOPROXY list is empty")
 	}
 
 	// We try to report the most helpful error to the user. "direct" and "noproxy"
 	// errors are best, followed by proxy errors other than ErrNotExist, followed
-	// by ErrNotExist. Note that errProxyOff, errNoproxy, and errUseProxy are
-	// equivalent to ErrNotExist.
+	// by ErrNotExist.
+	//
+	// Note that errProxyOff, errNoproxy, and errUseProxy are equivalent to
+	// ErrNotExist. errUseProxy should only be returned if "noproxy" is the only
+	// proxy. errNoproxy should never be returned, since there should always be a
+	// more useful error from "noproxy" first.
 	const (
 		notExistRank = iota
 		proxyRank
@@ -210,9 +164,9 @@ func TryProxies(f func(proxy string) error) error {
 		if err == nil {
 			return nil
 		}
-		isNotExistErr := errors.Is(err, os.ErrNotExist)
+		isNotExistErr := errors.Is(err, fs.ErrNotExist)
 
-		if proxy.url == "direct" || proxy.url == "noproxy" {
+		if proxy.url == "direct" || (proxy.url == "noproxy" && err != errUseProxy) {
 			bestErr = err
 			bestErrRank = directRank
 		} else if bestErrRank <= proxyRank && !isNotExistErr {
@@ -230,8 +184,9 @@ func TryProxies(f func(proxy string) error) error {
 }
 
 type proxyRepo struct {
-	url  *url.URL
-	path string
+	url         *url.URL
+	path        string
+	redactedURL string
 }
 
 func newProxyRepo(baseURL, path string) (Repo, error) {
@@ -244,22 +199,22 @@ func newProxyRepo(baseURL, path string) (Repo, error) {
 		// ok
 	case "file":
 		if *base != (url.URL{Scheme: base.Scheme, Path: base.Path, RawPath: base.RawPath}) {
-			return nil, fmt.Errorf("invalid file:// proxy URL with non-path elements: %s", web.Redacted(base))
+			return nil, fmt.Errorf("invalid file:// proxy URL with non-path elements: %s", base.Redacted())
 		}
 	case "":
-		return nil, fmt.Errorf("invalid proxy URL missing scheme: %s", web.Redacted(base))
+		return nil, fmt.Errorf("invalid proxy URL missing scheme: %s", base.Redacted())
 	default:
-		return nil, fmt.Errorf("invalid proxy URL scheme (must be https, http, file): %s", web.Redacted(base))
+		return nil, fmt.Errorf("invalid proxy URL scheme (must be https, http, file): %s", base.Redacted())
 	}
 
 	enc, err := module.EscapePath(path)
 	if err != nil {
 		return nil, err
 	}
-
+	redactedURL := base.Redacted()
 	base.Path = strings.TrimSuffix(base.Path, "/") + "/" + enc
 	base.RawPath = strings.TrimSuffix(base.RawPath, "/") + "/" + pathEscape(enc)
-	return &proxyRepo{base, path}, nil
+	return &proxyRepo{base, path, redactedURL}, nil
 }
 
 func (p *proxyRepo) ModulePath() string {
@@ -292,7 +247,7 @@ func (p *proxyRepo) getBytes(path string) ([]byte, error) {
 		return nil, err
 	}
 	defer body.Close()
-	return ioutil.ReadAll(body)
+	return io.ReadAll(body)
 }
 
 func (p *proxyRepo) getBody(path string) (io.ReadCloser, error) {
@@ -401,7 +356,7 @@ func (p *proxyRepo) Stat(rev string) (*RevInfo, error) {
 	}
 	info := new(RevInfo)
 	if err := json.Unmarshal(data, info); err != nil {
-		return nil, p.versionError(rev, err)
+		return nil, p.versionError(rev, fmt.Errorf("invalid response from proxy %q: %w", p.redactedURL, err))
 	}
 	if info.Version != rev && rev == module.CanonicalVersion(rev) && module.Check(p.path, rev) == nil {
 		// If we request a correct, appropriate version for the module path, the
@@ -415,14 +370,14 @@ func (p *proxyRepo) Stat(rev string) (*RevInfo, error) {
 func (p *proxyRepo) Latest() (*RevInfo, error) {
 	data, err := p.getBytes("@latest")
 	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
+		if !errors.Is(err, fs.ErrNotExist) {
 			return nil, p.versionError("", err)
 		}
 		return p.latest()
 	}
 	info := new(RevInfo)
 	if err := json.Unmarshal(data, info); err != nil {
-		return nil, p.versionError("", err)
+		return nil, p.versionError("", fmt.Errorf("invalid response from proxy %q: %w", p.redactedURL, err))
 	}
 	return info, nil
 }

@@ -9,17 +9,17 @@ import (
 	"cmd/internal/src"
 	"fmt"
 	"html"
+	exec "internal/execabs"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 )
 
 type HTMLWriter struct {
-	Logger
 	w             io.WriteCloser
+	Func          *Func
 	path          string
 	dot           *dotWriter
 	prevHash      []byte
@@ -27,22 +27,42 @@ type HTMLWriter struct {
 	pendingTitles []string
 }
 
-func NewHTMLWriter(path string, logger Logger, funcname, cfgMask string) *HTMLWriter {
+func NewHTMLWriter(path string, f *Func, cfgMask string) *HTMLWriter {
+	path = strings.Replace(path, "/", string(filepath.Separator), -1)
 	out, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
-		logger.Fatalf(src.NoXPos, "%v", err)
+		f.Fatalf("%v", err)
 	}
-	pwd, err := os.Getwd()
-	if err != nil {
-		logger.Fatalf(src.NoXPos, "%v", err)
+	reportPath := path
+	if !filepath.IsAbs(reportPath) {
+		pwd, err := os.Getwd()
+		if err != nil {
+			f.Fatalf("%v", err)
+		}
+		reportPath = filepath.Join(pwd, path)
 	}
-	html := HTMLWriter{w: out, Logger: logger, path: filepath.Join(pwd, path)}
-	html.dot = newDotWriter(cfgMask)
-	html.start(funcname)
+	html := HTMLWriter{
+		w:    out,
+		Func: f,
+		path: reportPath,
+		dot:  newDotWriter(cfgMask),
+	}
+	html.start()
 	return &html
 }
 
-func (w *HTMLWriter) start(name string) {
+// Fatalf reports an error and exits.
+func (w *HTMLWriter) Fatalf(msg string, args ...interface{}) {
+	fe := w.Func.Frontend()
+	fe.Fatalf(src.NoXPos, msg, args...)
+}
+
+// Logf calls the (w *HTMLWriter).Func's Logf method passing along a msg and args.
+func (w *HTMLWriter) Logf(msg string, args ...interface{}) {
+	w.Func.Logf(msg, args...)
+}
+
+func (w *HTMLWriter) start() {
 	if w == nil {
 		return
 	}
@@ -104,7 +124,8 @@ td.collapsed {
 }
 
 td.collapsed div {
-    /* TODO: Flip the direction of the phase's title 90 degrees on a collapsed column. */
+    text-align: right;
+    transform: rotate(180deg);
     writing-mode: vertical-lr;
     white-space: pre;
 }
@@ -128,6 +149,7 @@ pre {
     float: left;
     overflow: hidden;
     text-align: right;
+    margin-top: 7px;
 }
 
 .lines div {
@@ -341,6 +363,21 @@ body.darkmode ellipse.outline-black { outline: gray solid 2px; }
 </style>
 
 <script type="text/javascript">
+
+// Contains phase names which are expanded by default. Other columns are collapsed.
+let expandedDefault = [
+    "start",
+    "deadcode",
+    "opt",
+    "lower",
+    "late-deadcode",
+    "regalloc",
+    "genssa",
+];
+if (history.state === null) {
+    history.pushState({expandedDefault}, "", location.href);
+}
+
 // ordered list of all available highlight colors
 var highlights = [
     "highlight-aquamarine",
@@ -385,6 +422,9 @@ for (var i = 0; i < outlines.length; i++) {
 }
 
 window.onload = function() {
+    if (history.state !== null) {
+        expandedDefault = history.state.expandedDefault;
+    }
     if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) {
         toggleDarkMode();
         document.getElementById("dark-mode-button").checked = true;
@@ -392,9 +432,6 @@ window.onload = function() {
 
     var ssaElemClicked = function(elem, event, selections, selected) {
         event.stopPropagation();
-
-        // TODO: pushState with updated state and read it on page load,
-        // so that state can survive across reloads
 
         // find all values with the same name
         var c = elem.classList.item(0);
@@ -473,21 +510,18 @@ window.onload = function() {
         lines[i].addEventListener('click', ssaValueClicked);
     }
 
-    // Contains phase names which are expanded by default. Other columns are collapsed.
-    var expandedDefault = [
-        "start",
-        "deadcode",
-        "opt",
-        "lower",
-        "late-deadcode",
-        "regalloc",
-        "genssa",
-    ];
 
     function toggler(phase) {
         return function() {
             toggle_cell(phase+'-col');
             toggle_cell(phase+'-exp');
+            const i = expandedDefault.indexOf(phase);
+            if (i !== -1) {
+                expandedDefault.splice(i, 1);
+            } else {
+                expandedDefault.push(phase);
+            }
+            history.pushState({expandedDefault}, "", location.href);
         };
     }
 
@@ -515,9 +549,13 @@ window.onload = function() {
             const len = combined.length;
             if (len > 1) {
                 for (let i = 0; i < len; i++) {
-                    if (expandedDefault.indexOf(combined[i]) !== -1) {
-                        show = true;
-                        break;
+                    const num = expandedDefault.indexOf(combined[i]);
+                    if (num !== -1) {
+                        expandedDefault.splice(num, 1);
+                        if (expandedDefault.indexOf(phase) === -1) {
+                            expandedDefault.push(phase);
+                            show = true;
+                        }
                     }
                 }
             }
@@ -703,7 +741,7 @@ function toggleDarkMode() {
 </head>`)
 	w.WriteString("<body>")
 	w.WriteString("<h1>")
-	w.WriteString(html.EscapeString(name))
+	w.WriteString(html.EscapeString(w.Func.Name))
 	w.WriteString("</h1>")
 	w.WriteString(`
 <a href="#" onclick="toggle_visibility('help');return false;" id="helplink">help</a>
@@ -749,22 +787,36 @@ func (w *HTMLWriter) Close() {
 	fmt.Printf("dumped SSA to %v\n", w.path)
 }
 
-// WriteFunc writes f in a column headed by title.
+// WritePhase writes f in a column headed by title.
 // phase is used for collapsing columns and should be unique across the table.
-func (w *HTMLWriter) WriteFunc(phase, title string, f *Func) {
+func (w *HTMLWriter) WritePhase(phase, title string) {
 	if w == nil {
 		return // avoid generating HTML just to discard it
 	}
-	hash := hashFunc(f)
+	hash := hashFunc(w.Func)
 	w.pendingPhases = append(w.pendingPhases, phase)
 	w.pendingTitles = append(w.pendingTitles, title)
 	if !bytes.Equal(hash, w.prevHash) {
-		phases := strings.Join(w.pendingPhases, "  +  ")
-		w.WriteMultiTitleColumn(phases, w.pendingTitles, fmt.Sprintf("hash-%x", hash), f.HTML(phase, w.dot))
-		w.pendingPhases = w.pendingPhases[:0]
-		w.pendingTitles = w.pendingTitles[:0]
+		w.flushPhases()
 	}
 	w.prevHash = hash
+}
+
+// flushPhases collects any pending phases and titles, writes them to the html, and resets the pending slices.
+func (w *HTMLWriter) flushPhases() {
+	phaseLen := len(w.pendingPhases)
+	if phaseLen == 0 {
+		return
+	}
+	phases := strings.Join(w.pendingPhases, "  +  ")
+	w.WriteMultiTitleColumn(
+		phases,
+		w.pendingTitles,
+		fmt.Sprintf("hash-%x", w.prevHash),
+		w.Func.HTML(w.pendingPhases[phaseLen-1], w.dot),
+	)
+	w.pendingPhases = w.pendingPhases[:0]
+	w.pendingTitles = w.pendingTitles[:0]
 }
 
 // FuncLines contains source code for a function to be displayed
@@ -903,13 +955,13 @@ func (w *HTMLWriter) WriteMultiTitleColumn(phase string, titles []string, class,
 
 func (w *HTMLWriter) Printf(msg string, v ...interface{}) {
 	if _, err := fmt.Fprintf(w.w, msg, v...); err != nil {
-		w.Fatalf(src.NoXPos, "%v", err)
+		w.Fatalf("%v", err)
 	}
 }
 
 func (w *HTMLWriter) WriteString(s string) {
 	if _, err := io.WriteString(w.w, s); err != nil {
-		w.Fatalf(src.NoXPos, "%v", err)
+		w.Fatalf("%v", err)
 	}
 }
 
@@ -975,6 +1027,9 @@ func (b *Block) LongHTML() string {
 	s := fmt.Sprintf("<span class=\"%s ssa-block\">%s</span>", html.EscapeString(b.String()), html.EscapeString(b.Kind.String()))
 	if b.Aux != nil {
 		s += html.EscapeString(fmt.Sprintf(" {%v}", b.Aux))
+	}
+	if t := b.AuxIntString(); t != "" {
+		s += html.EscapeString(fmt.Sprintf(" [%v]", t))
 	}
 	for _, c := range b.ControlValues() {
 		s += fmt.Sprintf(" %s", c.HTML())

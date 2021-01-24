@@ -3,7 +3,9 @@
 // license that can be found in the LICENSE file.
 //
 // System calls and other sys.stuff for arm64, OpenBSD
-// /usr/src/sys/kern/syscalls.master for syscall numbers.
+// System calls are implemented in libc/libpthread, this file
+// contains trampolines that convert from Go to C calling convention.
+// Some direct system call implementations currently remain.
 //
 
 #include "go_asm.h"
@@ -13,228 +15,76 @@
 #define CLOCK_REALTIME	$0
 #define	CLOCK_MONOTONIC	$3
 
-// Exit the entire program (like C exit)
-TEXT runtime·exit(SB),NOSPLIT|NOFRAME,$0
-	MOVW	code+0(FP), R0		// arg 1 - status
-	MOVD	$1, R8			// sys_exit
-	SVC
-	BCC	3(PC)
-	MOVD	$0, R0			// crash on syscall failure
-	MOVD	R0, (R0)
-	RET
+// With OpenBSD 6.7 onwards, an arm64 syscall returns two instructions
+// after the SVC instruction, to allow for a speculative execution
+// barrier to be placed after the SVC without impacting performance.
+// For now use hardware no-ops as this works with both older and newer
+// kernels. After OpenBSD 6.8 is released this should be changed to
+// speculation barriers.
+#define	INVOKE_SYSCALL	\
+	SVC;		\
+	NOOP;		\
+	NOOP
 
-// func exitThread(wait *uint32)
-TEXT runtime·exitThread(SB),NOSPLIT,$0
-	MOVD	wait+0(FP), R0		// arg 1 - notdead
-	MOVD	$302, R8		// sys___threxit
-	SVC
-	MOVD	$0, R0			// crash on syscall failure
-	MOVD	R0, (R0)
-	JMP	0(PC)
+// mstart_stub is the first function executed on a new thread started by pthread_create.
+// It just does some low-level setup and then calls mstart.
+// Note: called with the C calling convention.
+TEXT runtime·mstart_stub(SB),NOSPLIT,$160
+	// R0 points to the m.
+	// We are already on m's g0 stack.
 
-TEXT runtime·open(SB),NOSPLIT|NOFRAME,$0
-	MOVD	name+0(FP), R0		// arg 1 - path
-	MOVW	mode+8(FP), R1		// arg 2 - mode
-	MOVW	perm+12(FP), R2		// arg 3 - perm
-	MOVD	$5, R8			// sys_open
-	SVC
-	BCC	2(PC)
-	MOVW	$-1, R0
-	MOVW	R0, ret+16(FP)
-	RET
+	// Save callee-save registers.
+	MOVD	R19, 8(RSP)
+	MOVD	R20, 16(RSP)
+	MOVD	R21, 24(RSP)
+	MOVD	R22, 32(RSP)
+	MOVD	R23, 40(RSP)
+	MOVD	R24, 48(RSP)
+	MOVD	R25, 56(RSP)
+	MOVD	R26, 64(RSP)
+	MOVD	R27, 72(RSP)
+	MOVD	g, 80(RSP)
+	MOVD	R29, 88(RSP)
+	FMOVD	F8, 96(RSP)
+	FMOVD	F9, 104(RSP)
+	FMOVD	F10, 112(RSP)
+	FMOVD	F11, 120(RSP)
+	FMOVD	F12, 128(RSP)
+	FMOVD	F13, 136(RSP)
+	FMOVD	F14, 144(RSP)
+	FMOVD	F15, 152(RSP)
 
-TEXT runtime·closefd(SB),NOSPLIT|NOFRAME,$0
-	MOVW	fd+0(FP), R0		// arg 1 - fd
-	MOVD	$6, R8			// sys_close
-	SVC
-	BCC	2(PC)
-	MOVW	$-1, R0
-	MOVW	R0, ret+8(FP)
-	RET
+	MOVD    m_g0(R0), g
+	BL	runtime·save_g(SB)
 
-TEXT runtime·read(SB),NOSPLIT|NOFRAME,$0
-	MOVW	fd+0(FP), R0		// arg 1 - fd
-	MOVD	p+8(FP), R1		// arg 2 - buf
-	MOVW	n+16(FP), R2		// arg 3 - nbyte
-	MOVD	$3, R8			// sys_read
-	SVC
-	BCC	2(PC)
-	NEG	R0, R0
-	MOVW	R0, ret+24(FP)
-	RET
+	BL	runtime·mstart(SB)
 
-// func pipe() (r, w int32, errno int32)
-TEXT runtime·pipe(SB),NOSPLIT|NOFRAME,$0-12
-	MOVD	$r+0(FP), R0
-	MOVW	$0, R1
-	MOVD	$101, R8		// sys_pipe2
-	SVC
-	BCC	2(PC)
-	NEG	R0, R0
-	MOVW	R0, errno+8(FP)
-	RET
+	// Restore callee-save registers.
+	MOVD	8(RSP), R19
+	MOVD	16(RSP), R20
+	MOVD	24(RSP), R21
+	MOVD	32(RSP), R22
+	MOVD	40(RSP), R23
+	MOVD	48(RSP), R24
+	MOVD	56(RSP), R25
+	MOVD	64(RSP), R26
+	MOVD	72(RSP), R27
+	MOVD	80(RSP), g
+	MOVD	88(RSP), R29
+	FMOVD	96(RSP), F8
+	FMOVD	104(RSP), F9
+	FMOVD	112(RSP), F10
+	FMOVD	120(RSP), F11
+	FMOVD	128(RSP), F12
+	FMOVD	136(RSP), F13
+	FMOVD	144(RSP), F14
+	FMOVD	152(RSP), F15
 
-// func pipe2(flags int32) (r, w int32, errno int32)
-TEXT runtime·pipe2(SB),NOSPLIT|NOFRAME,$0-20
-	MOVD	$r+8(FP), R0
-	MOVW	flags+0(FP), R1
-	MOVD	$101, R8		// sys_pipe2
-	SVC
-	BCC	2(PC)
-	NEG	R0, R0
-	MOVW	R0, errno+16(FP)
-	RET
-
-TEXT runtime·write1(SB),NOSPLIT|NOFRAME,$0
-	MOVD	fd+0(FP), R0		// arg 1 - fd
-	MOVD	p+8(FP), R1		// arg 2 - buf
-	MOVW	n+16(FP), R2		// arg 3 - nbyte
-	MOVD	$4, R8			// sys_write
-	SVC
-	BCC	2(PC)
-	NEG	R0, R0
-	MOVW	R0, ret+24(FP)
-	RET
-
-TEXT runtime·usleep(SB),NOSPLIT,$24-4
-	MOVWU	usec+0(FP), R3
-	MOVD	R3, R5
-	MOVW	$1000000, R4
-	UDIV	R4, R3
-	MOVD	R3, 8(RSP)		// tv_sec
-	MUL	R3, R4
-	SUB	R4, R5
-	MOVW	$1000, R4
-	MUL	R4, R5
-	MOVD	R5, 16(RSP)		// tv_nsec
-
-	ADD	$8, RSP, R0		// arg 1 - rqtp
-	MOVD	$0, R1			// arg 2 - rmtp
-	MOVD	$91, R8			// sys_nanosleep
-	SVC
-	RET
-
-TEXT runtime·getthrid(SB),NOSPLIT,$0-4
-	MOVD	$299, R8		// sys_getthrid
-	SVC
-	MOVW	R0, ret+0(FP)
-	RET
-
-TEXT runtime·thrkill(SB),NOSPLIT,$0-16
-	MOVW	tid+0(FP), R0		// arg 1 - tid
-	MOVD	sig+8(FP), R1		// arg 2 - signum
-	MOVW	$0, R2			// arg 3 - tcb
-	MOVD	$119, R8		// sys_thrkill
-	SVC
-	RET
-
-TEXT runtime·raiseproc(SB),NOSPLIT,$0
-	MOVD	$20, R8			// sys_getpid
-	SVC
-					// arg 1 - pid, already in R0
-	MOVW	sig+0(FP), R1		// arg 2 - signum
-	MOVD	$122, R8		// sys_kill
-	SVC
-	RET
-
-TEXT runtime·mmap(SB),NOSPLIT,$0
-	MOVD	addr+0(FP), R0		// arg 1 - addr
-	MOVD	n+8(FP), R1		// arg 2 - len
-	MOVW	prot+16(FP), R2		// arg 3 - prot
-	MOVW	flags+20(FP), R3	// arg 4 - flags
-	MOVW	fd+24(FP), R4		// arg 5 - fd
-	MOVW	$0, R5			// arg 6 - pad
-	MOVW	off+28(FP), R6		// arg 7 - offset
-	MOVD	$197, R8		// sys_mmap
-	SVC
-	MOVD	$0, R1
-	BCC	3(PC)
-	MOVD	R0, R1			// if error, move to R1
+	// Go is all done with this OS thread.
+	// Tell pthread everything is ok (we never join with this thread, so
+	// the value here doesn't really matter).
 	MOVD	$0, R0
-	MOVD	R0, p+32(FP)
-	MOVD	R1, err+40(FP)
-	RET
 
-TEXT runtime·munmap(SB),NOSPLIT,$0
-	MOVD	addr+0(FP), R0		// arg 1 - addr
-	MOVD	n+8(FP), R1		// arg 2 - len
-	MOVD	$73, R8			// sys_munmap
-	SVC
-	BCC	3(PC)
-	MOVD	$0, R0			// crash on syscall failure
-	MOVD	R0, (R0)
-	RET
-
-TEXT runtime·madvise(SB),NOSPLIT,$0
-	MOVD	addr+0(FP), R0		// arg 1 - addr
-	MOVD	n+8(FP), R1		// arg 2 - len
-	MOVW	flags+16(FP), R2	// arg 2 - flags
-	MOVD	$75, R8			// sys_madvise
-	SVC
-	BCC	2(PC)
-	MOVW	$-1, R0
-	MOVW	R0, ret+24(FP)
-	RET
-
-TEXT runtime·setitimer(SB),NOSPLIT,$0
-	MOVW	mode+0(FP), R0		// arg 1 - mode
-	MOVD	new+8(FP), R1		// arg 2 - new value
-	MOVD	old+16(FP), R2		// arg 3 - old value
-	MOVD	$69, R8			// sys_setitimer
-	SVC
-	RET
-
-// func walltime1() (sec int64, nsec int32)
-TEXT runtime·walltime1(SB), NOSPLIT, $32
-	MOVW	CLOCK_REALTIME, R0	// arg 1 - clock_id
-	MOVD	$8(RSP), R1		// arg 2 - tp
-	MOVD	$87, R8			// sys_clock_gettime
-	SVC
-
-	MOVD	8(RSP), R0		// sec
-	MOVD	16(RSP), R1		// nsec
-	MOVD	R0, sec+0(FP)
-	MOVW	R1, nsec+8(FP)
-
-	RET
-
-// int64 nanotime1(void) so really
-// void nanotime1(int64 *nsec)
-TEXT runtime·nanotime1(SB),NOSPLIT,$32
-	MOVW	CLOCK_MONOTONIC, R0	// arg 1 - clock_id
-	MOVD	$8(RSP), R1		// arg 2 - tp
-	MOVD	$87, R8			// sys_clock_gettime
-	SVC
-
-	MOVW	8(RSP), R3		// sec
-	MOVW	16(RSP), R5		// nsec
-
-	MOVD	$1000000000, R4
-	MUL	R4, R3
-	ADD	R5, R3
-	MOVD	R3, ret+0(FP)
-	RET
-
-TEXT runtime·sigaction(SB),NOSPLIT,$0
-	MOVW	sig+0(FP), R0		// arg 1 - signum
-	MOVD	new+8(FP), R1		// arg 2 - new sigaction
-	MOVD	old+16(FP), R2		// arg 3 - old sigaction
-	MOVD	$46, R8			// sys_sigaction
-	SVC
-	BCC	3(PC)
-	MOVD	$3, R0			// crash on syscall failure
-	MOVD	R0, (R0)
-	RET
-
-TEXT runtime·obsdsigprocmask(SB),NOSPLIT,$0
-	MOVW	how+0(FP), R0		// arg 1 - mode
-	MOVW	new+4(FP), R1		// arg 2 - new
-	MOVD	$48, R8			// sys_sigprocmask
-	SVC
-	BCC	3(PC)
-	MOVD	$3, R8			// crash on syscall failure
-	MOVD	R8, (R8)
-	MOVW	R0, ret+8(FP)
 	RET
 
 TEXT runtime·sigfwd(SB),NOSPLIT,$0-32
@@ -271,9 +121,6 @@ TEXT runtime·sigtramp(SB),NOSPLIT,$192
 	// If called from an external code context, g will not be set.
 	// Save R0, since runtime·load_g will clobber it.
 	MOVW	R0, 8(RSP)		// signum
-	MOVB	runtime·iscgo(SB), R0
-	CMP	$0, R0
-	BEQ	2(PC)
 	BL	runtime·load_g(SB)
 
 	MOVD	R1, 16(RSP)
@@ -303,48 +150,273 @@ TEXT runtime·sigtramp(SB),NOSPLIT,$192
 
 	RET
 
-// int32 tfork(void *param, uintptr psize, M *mp, G *gp, void (*fn)(void));
-TEXT runtime·tfork(SB),NOSPLIT,$0
-
-	// Copy mp, gp and fn off parent stack for use by child.
-	MOVD	mm+16(FP), R4
-	MOVD	gg+24(FP), R5
-	MOVD	fn+32(FP), R6
-
-	MOVD	param+0(FP), R0		// arg 1 - param
-	MOVD	psize+8(FP), R1		// arg 2 - psize
-	MOVD	$8, R8			// sys___tfork
-	SVC
-
-	// Return if syscall failed.
-	BCC	4(PC)
-	NEG	R0,  R0
-	MOVW	R0, ret+40(FP)
+//
+// These trampolines help convert from Go calling convention to C calling convention.
+// They should be called with asmcgocall.
+// A pointer to the arguments is passed in R0.
+// A single int32 result is returned in R0.
+// (For more results, make an args/results structure.)
+TEXT runtime·pthread_attr_init_trampoline(SB),NOSPLIT,$0
+	MOVD	0(R0), R0		// arg 1 - attr
+	CALL	libc_pthread_attr_init(SB)
 	RET
 
-	// In parent, return.
-	CMP	$0, R0
-	BEQ	3(PC)
-	MOVW	R0, ret+40(FP)
+TEXT runtime·pthread_attr_destroy_trampoline(SB),NOSPLIT,$0
+	MOVD	0(R0), R0		// arg 1 - attr
+	CALL	libc_pthread_attr_destroy(SB)
 	RET
 
-	// Initialise m, g.
-	MOVD	R5, g
-	MOVD	R4, g_m(g)
+TEXT runtime·pthread_attr_getstacksize_trampoline(SB),NOSPLIT,$0
+	MOVD	8(R0), R1		// arg 2 - size
+	MOVD	0(R0), R0		// arg 1 - attr
+	CALL	libc_pthread_attr_getstacksize(SB)
+	RET
 
-	// Call fn.
-	BL	(R6)
+TEXT runtime·pthread_attr_setdetachstate_trampoline(SB),NOSPLIT,$0
+	MOVD	8(R0), R1		// arg 2 - state
+	MOVD	0(R0), R0		// arg 1 - attr
+	CALL	libc_pthread_attr_setdetachstate(SB)
+	RET
 
-	// fn should never return.
-	MOVD	$2, R8			// crash if reached
+TEXT runtime·pthread_create_trampoline(SB),NOSPLIT,$0
+	MOVD	0(R0), R1		// arg 2 - attr
+	MOVD	8(R0), R2		// arg 3 - start
+	MOVD	16(R0), R3		// arg 4 - arg
+	SUB	$16, RSP
+	MOVD	RSP, R0			// arg 1 - &threadid (discard)
+	CALL	libc_pthread_create(SB)
+	ADD	$16, RSP
+	RET
+
+// Exit the entire program (like C exit)
+TEXT runtime·exit(SB),NOSPLIT|NOFRAME,$0
+	MOVW	code+0(FP), R0		// arg 1 - status
+	MOVD	$1, R8			// sys_exit
+	INVOKE_SYSCALL
+	BCC	3(PC)
+	MOVD	$0, R0			// crash on syscall failure
+	MOVD	R0, (R0)
+	RET
+
+// func exitThread(wait *uint32)
+TEXT runtime·exitThread(SB),NOSPLIT,$0
+	MOVD	wait+0(FP), R0		// arg 1 - notdead
+	MOVD	$302, R8		// sys___threxit
+	INVOKE_SYSCALL
+	MOVD	$0, R0			// crash on syscall failure
+	MOVD	R0, (R0)
+	JMP	0(PC)
+
+TEXT runtime·open(SB),NOSPLIT|NOFRAME,$0
+	MOVD	name+0(FP), R0		// arg 1 - path
+	MOVW	mode+8(FP), R1		// arg 2 - mode
+	MOVW	perm+12(FP), R2		// arg 3 - perm
+	MOVD	$5, R8			// sys_open
+	INVOKE_SYSCALL
+	BCC	2(PC)
+	MOVW	$-1, R0
+	MOVW	R0, ret+16(FP)
+	RET
+
+TEXT runtime·closefd(SB),NOSPLIT|NOFRAME,$0
+	MOVW	fd+0(FP), R0		// arg 1 - fd
+	MOVD	$6, R8			// sys_close
+	INVOKE_SYSCALL
+	BCC	2(PC)
+	MOVW	$-1, R0
+	MOVW	R0, ret+8(FP)
+	RET
+
+TEXT runtime·read(SB),NOSPLIT|NOFRAME,$0
+	MOVW	fd+0(FP), R0		// arg 1 - fd
+	MOVD	p+8(FP), R1		// arg 2 - buf
+	MOVW	n+16(FP), R2		// arg 3 - nbyte
+	MOVD	$3, R8			// sys_read
+	INVOKE_SYSCALL
+	BCC	2(PC)
+	NEG	R0, R0
+	MOVW	R0, ret+24(FP)
+	RET
+
+// func pipe() (r, w int32, errno int32)
+TEXT runtime·pipe(SB),NOSPLIT|NOFRAME,$0-12
+	MOVD	$r+0(FP), R0
+	MOVW	$0, R1
+	MOVD	$101, R8		// sys_pipe2
+	INVOKE_SYSCALL
+	BCC	2(PC)
+	NEG	R0, R0
+	MOVW	R0, errno+8(FP)
+	RET
+
+// func pipe2(flags int32) (r, w int32, errno int32)
+TEXT runtime·pipe2(SB),NOSPLIT|NOFRAME,$0-20
+	MOVD	$r+8(FP), R0
+	MOVW	flags+0(FP), R1
+	MOVD	$101, R8		// sys_pipe2
+	INVOKE_SYSCALL
+	BCC	2(PC)
+	NEG	R0, R0
+	MOVW	R0, errno+16(FP)
+	RET
+
+TEXT runtime·write1(SB),NOSPLIT|NOFRAME,$0
+	MOVD	fd+0(FP), R0		// arg 1 - fd
+	MOVD	p+8(FP), R1		// arg 2 - buf
+	MOVW	n+16(FP), R2		// arg 3 - nbyte
+	MOVD	$4, R8			// sys_write
+	INVOKE_SYSCALL
+	BCC	2(PC)
+	NEG	R0, R0
+	MOVW	R0, ret+24(FP)
+	RET
+
+TEXT runtime·usleep(SB),NOSPLIT,$24-4
+	MOVWU	usec+0(FP), R3
+	MOVD	R3, R5
+	MOVW	$1000000, R4
+	UDIV	R4, R3
+	MOVD	R3, 8(RSP)		// tv_sec
+	MUL	R3, R4
+	SUB	R4, R5
+	MOVW	$1000, R4
+	MUL	R4, R5
+	MOVD	R5, 16(RSP)		// tv_nsec
+
+	ADD	$8, RSP, R0		// arg 1 - rqtp
+	MOVD	$0, R1			// arg 2 - rmtp
+	MOVD	$91, R8			// sys_nanosleep
+	INVOKE_SYSCALL
+	RET
+
+TEXT runtime·getthrid(SB),NOSPLIT,$0-4
+	MOVD	$299, R8		// sys_getthrid
+	INVOKE_SYSCALL
+	MOVW	R0, ret+0(FP)
+	RET
+
+TEXT runtime·thrkill(SB),NOSPLIT,$0-16
+	MOVW	tid+0(FP), R0		// arg 1 - tid
+	MOVD	sig+8(FP), R1		// arg 2 - signum
+	MOVW	$0, R2			// arg 3 - tcb
+	MOVD	$119, R8		// sys_thrkill
+	INVOKE_SYSCALL
+	RET
+
+TEXT runtime·raiseproc(SB),NOSPLIT,$0
+	MOVD	$20, R8			// sys_getpid
+	INVOKE_SYSCALL
+					// arg 1 - pid, already in R0
+	MOVW	sig+0(FP), R1		// arg 2 - signum
+	MOVD	$122, R8		// sys_kill
+	INVOKE_SYSCALL
+	RET
+
+TEXT runtime·mmap(SB),NOSPLIT,$0
+	MOVD	addr+0(FP), R0		// arg 1 - addr
+	MOVD	n+8(FP), R1		// arg 2 - len
+	MOVW	prot+16(FP), R2		// arg 3 - prot
+	MOVW	flags+20(FP), R3	// arg 4 - flags
+	MOVW	fd+24(FP), R4		// arg 5 - fd
+	MOVW	$0, R5			// arg 6 - pad
+	MOVW	off+28(FP), R6		// arg 7 - offset
+	MOVD	$197, R8		// sys_mmap
+	INVOKE_SYSCALL
+	MOVD	$0, R1
+	BCC	3(PC)
+	MOVD	R0, R1			// if error, move to R1
+	MOVD	$0, R0
+	MOVD	R0, p+32(FP)
+	MOVD	R1, err+40(FP)
+	RET
+
+TEXT runtime·munmap(SB),NOSPLIT,$0
+	MOVD	addr+0(FP), R0		// arg 1 - addr
+	MOVD	n+8(FP), R1		// arg 2 - len
+	MOVD	$73, R8			// sys_munmap
+	INVOKE_SYSCALL
+	BCC	3(PC)
+	MOVD	$0, R0			// crash on syscall failure
+	MOVD	R0, (R0)
+	RET
+
+TEXT runtime·madvise(SB),NOSPLIT,$0
+	MOVD	addr+0(FP), R0		// arg 1 - addr
+	MOVD	n+8(FP), R1		// arg 2 - len
+	MOVW	flags+16(FP), R2	// arg 2 - flags
+	MOVD	$75, R8			// sys_madvise
+	INVOKE_SYSCALL
+	BCC	2(PC)
+	MOVW	$-1, R0
+	MOVW	R0, ret+24(FP)
+	RET
+
+TEXT runtime·setitimer(SB),NOSPLIT,$0
+	MOVW	mode+0(FP), R0		// arg 1 - mode
+	MOVD	new+8(FP), R1		// arg 2 - new value
+	MOVD	old+16(FP), R2		// arg 3 - old value
+	MOVD	$69, R8			// sys_setitimer
+	INVOKE_SYSCALL
+	RET
+
+// func walltime1() (sec int64, nsec int32)
+TEXT runtime·walltime1(SB), NOSPLIT, $32
+	MOVW	CLOCK_REALTIME, R0	// arg 1 - clock_id
+	MOVD	$8(RSP), R1		// arg 2 - tp
+	MOVD	$87, R8			// sys_clock_gettime
+	INVOKE_SYSCALL
+
+	MOVD	8(RSP), R0		// sec
+	MOVD	16(RSP), R1		// nsec
+	MOVD	R0, sec+0(FP)
+	MOVW	R1, nsec+8(FP)
+
+	RET
+
+// int64 nanotime1(void) so really
+// void nanotime1(int64 *nsec)
+TEXT runtime·nanotime1(SB),NOSPLIT,$32
+	MOVW	CLOCK_MONOTONIC, R0	// arg 1 - clock_id
+	MOVD	$8(RSP), R1		// arg 2 - tp
+	MOVD	$87, R8			// sys_clock_gettime
+	INVOKE_SYSCALL
+
+	MOVW	8(RSP), R3		// sec
+	MOVW	16(RSP), R5		// nsec
+
+	MOVD	$1000000000, R4
+	MUL	R4, R3
+	ADD	R5, R3
+	MOVD	R3, ret+0(FP)
+	RET
+
+TEXT runtime·sigaction(SB),NOSPLIT,$0
+	MOVW	sig+0(FP), R0		// arg 1 - signum
+	MOVD	new+8(FP), R1		// arg 2 - new sigaction
+	MOVD	old+16(FP), R2		// arg 3 - old sigaction
+	MOVD	$46, R8			// sys_sigaction
+	INVOKE_SYSCALL
+	BCC	3(PC)
+	MOVD	$3, R0			// crash on syscall failure
+	MOVD	R0, (R0)
+	RET
+
+TEXT runtime·obsdsigprocmask(SB),NOSPLIT,$0
+	MOVW	how+0(FP), R0		// arg 1 - mode
+	MOVW	new+4(FP), R1		// arg 2 - new
+	MOVD	$48, R8			// sys_sigprocmask
+	INVOKE_SYSCALL
+	BCC	3(PC)
+	MOVD	$3, R8			// crash on syscall failure
 	MOVD	R8, (R8)
+	MOVW	R0, ret+8(FP)
 	RET
 
 TEXT runtime·sigaltstack(SB),NOSPLIT,$0
 	MOVD	new+0(FP), R0		// arg 1 - new sigaltstack
 	MOVD	old+8(FP), R1		// arg 2 - old sigaltstack
 	MOVD	$288, R8		// sys_sigaltstack
-	SVC
+	INVOKE_SYSCALL
 	BCC	3(PC)
 	MOVD	$0, R8			// crash on syscall failure
 	MOVD	R8, (R8)
@@ -352,7 +424,7 @@ TEXT runtime·sigaltstack(SB),NOSPLIT,$0
 
 TEXT runtime·osyield(SB),NOSPLIT,$0
 	MOVD	$298, R8		// sys_sched_yield
-	SVC
+	INVOKE_SYSCALL
 	RET
 
 TEXT runtime·thrsleep(SB),NOSPLIT,$0
@@ -362,7 +434,7 @@ TEXT runtime·thrsleep(SB),NOSPLIT,$0
 	MOVD	lock+24(FP), R3		// arg 4 - lock
 	MOVD	abort+32(FP), R4	// arg 5 - abort
 	MOVD	$94, R8			// sys___thrsleep
-	SVC
+	INVOKE_SYSCALL
 	MOVW	R0, ret+40(FP)
 	RET
 
@@ -370,7 +442,7 @@ TEXT runtime·thrwakeup(SB),NOSPLIT,$0
 	MOVD	ident+0(FP), R0		// arg 1 - ident
 	MOVW	n+8(FP), R1		// arg 2 - n
 	MOVD	$301, R8		// sys___thrwakeup
-	SVC
+	INVOKE_SYSCALL
 	MOVW	R0, ret+16(FP)
 	RET
 
@@ -382,7 +454,7 @@ TEXT runtime·sysctl(SB),NOSPLIT,$0
 	MOVD	dst+32(FP), R4		// arg 5 - dest
 	MOVD	ndst+40(FP), R5		// arg 6 - newlen
 	MOVD	$202, R8		// sys___sysctl
-	SVC
+	INVOKE_SYSCALL
 	BCC	2(PC)
 	NEG	R0, R0
 	MOVW	R0, ret+48(FP)
@@ -391,7 +463,7 @@ TEXT runtime·sysctl(SB),NOSPLIT,$0
 // int32 runtime·kqueue(void);
 TEXT runtime·kqueue(SB),NOSPLIT,$0
 	MOVD	$269, R8		// sys_kqueue
-	SVC
+	INVOKE_SYSCALL
 	BCC	2(PC)
 	NEG	R0, R0
 	MOVW	R0, ret+0(FP)
@@ -406,7 +478,7 @@ TEXT runtime·kevent(SB),NOSPLIT,$0
 	MOVW	nev+32(FP), R4		// arg 5 - nevents
 	MOVD	ts+40(FP), R5		// arg 6 - timeout
 	MOVD	$72, R8			// sys_kevent
-	SVC
+	INVOKE_SYSCALL
 	BCC	2(PC)
 	NEG	R0, R0
 	MOVW	R0, ret+48(FP)
@@ -418,7 +490,7 @@ TEXT runtime·closeonexec(SB),NOSPLIT,$0
 	MOVD	$2, R1			// arg 2 - cmd (F_SETFD)
 	MOVD	$1, R2			// arg 3 - arg (FD_CLOEXEC)
 	MOVD	$92, R8			// sys_fcntl
-	SVC
+	INVOKE_SYSCALL
 	RET
 
 // func runtime·setNonblock(int32 fd)
@@ -427,11 +499,11 @@ TEXT runtime·setNonblock(SB),NOSPLIT|NOFRAME,$0-4
 	MOVD	$3, R1			// arg 2 - cmd (F_GETFL)
 	MOVD	$0, R2			// arg 3
 	MOVD	$92, R8			// sys_fcntl
-	SVC
+	INVOKE_SYSCALL
 	MOVD	$4, R2			// O_NONBLOCK
 	ORR	R0, R2			// arg 3 - flags
 	MOVW	fd+0(FP), R0		// arg 1 - fd
 	MOVD	$4, R1			// arg 2 - cmd (F_SETFL)
 	MOVD	$92, R8			// sys_fcntl
-	SVC
+	INVOKE_SYSCALL
 	RET

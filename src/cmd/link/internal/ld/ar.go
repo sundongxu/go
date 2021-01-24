@@ -1,5 +1,5 @@
 // Inferno utils/include/ar.h
-// https://bitbucket.org/inferno-os/inferno-os/src/default/utils/include/ar.h
+// https://bitbucket.org/inferno-os/inferno-os/src/master/utils/include/ar.h
 //
 //	Copyright © 1994-1999 Lucent Technologies Inc.  All rights reserved.
 //	Portions Copyright © 1995-1997 C H Forsyth (forsyth@terzarima.net)
@@ -170,7 +170,7 @@ func readArmap(filename string, f *bio.Reader, arhdr ArHdr) archiveMap {
 
 		// For Mach-O and PE/386 files we strip a leading
 		// underscore from the symbol name.
-		if objabi.GOOS == "darwin" || (objabi.GOOS == "windows" && objabi.GOARCH == "386") {
+		if objabi.GOOS == "darwin" || objabi.GOOS == "ios" || (objabi.GOOS == "windows" && objabi.GOARCH == "386") {
 			if name[0] == '_' && len(name) > 1 {
 				name = name[1:]
 			}

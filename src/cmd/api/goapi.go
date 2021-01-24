@@ -16,11 +16,10 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	exec "internal/execabs"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -60,8 +59,6 @@ var contexts = []*build.Context{
 	{GOOS: "linux", GOARCH: "amd64"},
 	{GOOS: "linux", GOARCH: "arm", CgoEnabled: true},
 	{GOOS: "linux", GOARCH: "arm"},
-	{GOOS: "darwin", GOARCH: "386", CgoEnabled: true},
-	{GOOS: "darwin", GOARCH: "386"},
 	{GOOS: "darwin", GOARCH: "amd64", CgoEnabled: true},
 	{GOOS: "darwin", GOARCH: "amd64"},
 	{GOOS: "windows", GOARCH: "amd64"},
@@ -89,7 +86,10 @@ var contexts = []*build.Context{
 func contextName(c *build.Context) string {
 	s := c.GOOS + "-" + c.GOARCH
 	if c.CgoEnabled {
-		return s + "-cgo"
+		s += "-cgo"
+	}
+	if c.Dir != "" {
+		s += fmt.Sprintf(" [%s]", c.Dir)
 	}
 	return s
 }
@@ -252,6 +252,13 @@ func featureWithoutContext(f string) string {
 	return spaceParensRx.ReplaceAllString(f, "")
 }
 
+// portRemoved reports whether the given port-specific API feature is
+// okay to no longer exist because its port was removed.
+func portRemoved(feature string) bool {
+	return strings.Contains(feature, "(darwin-386)") ||
+		strings.Contains(feature, "(darwin-386-cgo)")
+}
+
 func compareAPI(w io.Writer, features, required, optional, exception []string, allowAdd bool) (ok bool) {
 	ok = true
 
@@ -279,6 +286,8 @@ func compareAPI(w io.Writer, features, required, optional, exception []string, a
 				// acknowledged by being in the file
 				// "api/except.txt". No need to print them out
 				// here.
+			} else if portRemoved(feature) {
+				// okay.
 			} else if featureSet[featureWithoutContext(feature)] {
 				// okay.
 			} else {
@@ -316,15 +325,29 @@ func compareAPI(w io.Writer, features, required, optional, exception []string, a
 	return
 }
 
+// aliasReplacer applies type aliases to earlier API files,
+// to avoid misleading negative results.
+// This makes all the references to os.FileInfo in go1.txt
+// be read as if they said fs.FileInfo, since os.FileInfo is now an alias.
+// If there are many of these, we could do a more general solution,
+// but for now the replacer is fine.
+var aliasReplacer = strings.NewReplacer(
+	"os.FileInfo", "fs.FileInfo",
+	"os.FileMode", "fs.FileMode",
+	"os.PathError", "fs.PathError",
+)
+
 func fileFeatures(filename string) []string {
 	if filename == "" {
 		return nil
 	}
-	bs, err := ioutil.ReadFile(filename)
+	bs, err := os.ReadFile(filename)
 	if err != nil {
 		log.Fatalf("Error reading file %s: %v", filename, err)
 	}
-	lines := strings.Split(string(bs), "\n")
+	s := string(bs)
+	s = aliasReplacer.Replace(s)
+	lines := strings.Split(s, "\n")
 	var nonblank []string
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -437,6 +460,11 @@ type listImports struct {
 
 var listCache sync.Map // map[string]listImports, keyed by contextName
 
+// listSem is a semaphore restricting concurrent invocations of 'go list'.
+var listSem = make(chan semToken, runtime.GOMAXPROCS(0))
+
+type semToken struct{}
+
 // loadImports populates w with information about the packages in the standard
 // library and the packages they themselves import in w's build context.
 //
@@ -461,8 +489,14 @@ func (w *Walker) loadImports() {
 
 	imports, ok := listCache.Load(name)
 	if !ok {
+		listSem <- semToken{}
+		defer func() { <-listSem }()
+
 		cmd := exec.Command(goCmd(), "list", "-e", "-deps", "-json", "std")
 		cmd.Env = listEnv(w.context)
+		if w.context.Dir != "" {
+			cmd.Dir = w.context.Dir
+		}
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			log.Fatalf("loading imports: %v\n%s", err, out)
@@ -476,6 +510,7 @@ func (w *Walker) loadImports() {
 			var pkg struct {
 				ImportPath, Dir string
 				ImportMap       map[string]string
+				Standard        bool
 			}
 			err := dec.Decode(&pkg)
 			if err == io.EOF {
@@ -488,11 +523,13 @@ func (w *Walker) loadImports() {
 			// - Package "unsafe" contains special signatures requiring
 			//   extra care when printing them - ignore since it is not
 			//   going to change w/o a language change.
-			// - internal and vendored packages do not contribute to our
-			//   API surface.
+			// - Internal and vendored packages do not contribute to our
+			//   API surface. (If we are running within the "std" module,
+			//   vendored dependencies appear as themselves instead of
+			//   their "vendor/" standard-library copies.)
 			// - 'go list std' does not include commands, which cannot be
 			//   imported anyway.
-			if ip := pkg.ImportPath; ip != "unsafe" && !strings.HasPrefix(ip, "vendor/") && !internalPkg.MatchString(ip) {
+			if ip := pkg.ImportPath; pkg.Standard && ip != "unsafe" && !strings.HasPrefix(ip, "vendor/") && !internalPkg.MatchString(ip) {
 				stdPackages = append(stdPackages, ip)
 			}
 			importDir[pkg.ImportPath] = pkg.Dir
@@ -832,6 +869,10 @@ func (w *Walker) emitObj(obj types.Object) {
 func (w *Walker) emitType(obj *types.TypeName) {
 	name := obj.Name()
 	typ := obj.Type()
+	if obj.IsAlias() {
+		w.emitf("type %s = %s", name, w.typeString(typ))
+		return
+	}
 	switch typ := typ.Underlying().(type) {
 	case *types.Struct:
 		w.emitStructType(name, typ)

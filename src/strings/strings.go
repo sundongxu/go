@@ -369,8 +369,9 @@ func Fields(s string) []string {
 // FieldsFunc splits the string s at each run of Unicode code points c satisfying f(c)
 // and returns an array of slices of s. If all code points in s satisfy f(c) or the
 // string is empty, an empty slice is returned.
-// FieldsFunc makes no guarantees about the order in which it calls f(c).
-// If f does not return consistent results for a given c, FieldsFunc may crash.
+//
+// FieldsFunc makes no guarantees about the order in which it calls f(c)
+// and assumes that f always returns the same value for a given c.
 func FieldsFunc(s string, f func(rune) bool) []string {
 	// A span is used to record a slice of s of the form s[start:end].
 	// The start index is inclusive and the end index is exclusive.
@@ -381,25 +382,29 @@ func FieldsFunc(s string, f func(rune) bool) []string {
 	spans := make([]span, 0, 32)
 
 	// Find the field start and end indices.
-	wasField := false
-	fromIndex := 0
-	for i, rune := range s {
+	// Doing this in a separate pass (rather than slicing the string s
+	// and collecting the result substrings right away) is significantly
+	// more efficient, possibly due to cache effects.
+	start := -1 // valid span start if >= 0
+	for end, rune := range s {
 		if f(rune) {
-			if wasField {
-				spans = append(spans, span{start: fromIndex, end: i})
-				wasField = false
+			if start >= 0 {
+				spans = append(spans, span{start, end})
+				// Set start to a negative value.
+				// Note: using -1 here consistently and reproducibly
+				// slows down this code by a several percent on amd64.
+				start = ^start
 			}
 		} else {
-			if !wasField {
-				fromIndex = i
-				wasField = true
+			if start < 0 {
+				start = end
 			}
 		}
 	}
 
 	// Last field might end at EOF.
-	if wasField {
-		spans = append(spans, span{fromIndex, len(s)})
+	if start >= 0 {
+		spans = append(spans, span{start, len(s)})
 	}
 
 	// Create strings from recorded field indices.
@@ -929,8 +934,8 @@ func Replace(s, old, new string, n int) string {
 	}
 
 	// Apply replacements to buffer.
-	t := make([]byte, len(s)+n*(len(new)-len(old)))
-	w := 0
+	var b Builder
+	b.Grow(len(s) + n*(len(new)-len(old)))
 	start := 0
 	for i := 0; i < n; i++ {
 		j := start
@@ -942,12 +947,12 @@ func Replace(s, old, new string, n int) string {
 		} else {
 			j += Index(s[start:], old)
 		}
-		w += copy(t[w:], s[start:j])
-		w += copy(t[w:], new)
+		b.WriteString(s[start:j])
+		b.WriteString(new)
 		start = j + len(old)
 	}
-	w += copy(t[w:], s[start:])
-	return string(t[0:w])
+	b.WriteString(s[start:])
+	return b.String()
 }
 
 // ReplaceAll returns a copy of the string s with all

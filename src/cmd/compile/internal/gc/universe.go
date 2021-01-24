@@ -123,21 +123,21 @@ func lexinit() {
 		asNode(s2.Def).SetSubOp(s.op)
 	}
 
-	types.Idealstring = types.New(TSTRING)
-	types.Idealbool = types.New(TBOOL)
+	types.UntypedString = types.New(TSTRING)
+	types.UntypedBool = types.New(TBOOL)
 	types.Types[TANY] = types.New(TANY)
 
 	s := builtinpkg.Lookup("true")
 	s.Def = asTypesNode(nodbool(true))
 	asNode(s.Def).Sym = lookup("true")
 	asNode(s.Def).Name = new(Name)
-	asNode(s.Def).Type = types.Idealbool
+	asNode(s.Def).Type = types.UntypedBool
 
 	s = builtinpkg.Lookup("false")
 	s.Def = asTypesNode(nodbool(false))
 	asNode(s.Def).Sym = lookup("false")
 	asNode(s.Def).Name = new(Name)
-	asNode(s.Def).Type = types.Idealbool
+	asNode(s.Def).Type = types.UntypedBool
 
 	s = lookup("_")
 	s.Block = -100
@@ -342,16 +342,16 @@ func typeinit() {
 	simtype[TFUNC] = TPTR
 	simtype[TUNSAFEPTR] = TPTR
 
-	slice_array = int(Rnd(0, int64(Widthptr)))
-	slice_nel = int(Rnd(int64(slice_array)+int64(Widthptr), int64(Widthptr)))
-	slice_cap = int(Rnd(int64(slice_nel)+int64(Widthptr), int64(Widthptr)))
-	sizeof_Slice = int(Rnd(int64(slice_cap)+int64(Widthptr), int64(Widthptr)))
+	slicePtrOffset = 0
+	sliceLenOffset = Rnd(slicePtrOffset+int64(Widthptr), int64(Widthptr))
+	sliceCapOffset = Rnd(sliceLenOffset+int64(Widthptr), int64(Widthptr))
+	sizeofSlice = Rnd(sliceCapOffset+int64(Widthptr), int64(Widthptr))
 
 	// string is same as slice wo the cap
-	sizeof_String = int(Rnd(int64(slice_nel)+int64(Widthptr), int64(Widthptr)))
+	sizeofString = Rnd(sliceLenOffset+int64(Widthptr), int64(Widthptr))
 
 	dowidth(types.Types[TSTRING])
-	dowidth(types.Idealstring)
+	dowidth(types.UntypedString)
 }
 
 func makeErrorInterface() *types.Type {

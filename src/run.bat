@@ -4,7 +4,7 @@
 
 @echo off
 
-if exist ..\bin\go goto ok
+if exist ..\bin\go.exe goto ok
 echo Must run run.bat from Go src directory after installing cmd/go.
 goto fail
 :ok
@@ -30,15 +30,10 @@ rem TODO avoid rebuild if possible
 
 if x%1==x--no-rebuild goto norebuild
 echo ##### Building packages and commands.
-go install -a -v std cmd
+..\bin\go install -a -v std cmd
 if errorlevel 1 goto fail
 echo.
 :norebuild
-
-:: we must unset GOROOT_FINAL before tests, because runtime/debug requires
-:: correct access to source code, so if we have GOROOT_FINAL in effect,
-:: at least runtime/debug test will fail.
-set GOROOT_FINAL=
 
 :: get CGO_ENABLED
 ..\bin\go env > env.bat
